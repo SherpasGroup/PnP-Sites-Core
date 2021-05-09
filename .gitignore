@@ -185,3 +185,4 @@ FakesAssemblies/
 
 # Output XML Files
 Core/OfficeDevPnP.Core.Tests/Resources/Templates/ProvisioningTemplate-*-OUT*.xml
+*.nupkg

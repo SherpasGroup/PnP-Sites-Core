@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Linq;
 using System.Net;
@@ -15,9 +16,12 @@ using Newtonsoft.Json;
 using OfficeDevPnP.Core.Utilities.Async;
 using System.IdentityModel.Tokens.Jwt;
 using System.Collections.Generic;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using OfficeDevPnP.Core.Utilities.Context;
 using OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers;
-
+using OfficeDevPnP.Core.Http;
+using JsonSerializer = Newtonsoft.Json.JsonSerializer;
 #if !SP2013 && !SP2016
 using OfficeDevPnP.Core.Sites;
 #endif
@@ -29,6 +33,9 @@ namespace Microsoft.SharePoint.Client
     /// </summary>
     public static partial class ClientContextExtensions
     {
+#pragma warning disable CS0169
+        private static ConcurrentDictionary<string, (string requestDigest, DateTime expiresOn)> requestDigestInfos = new ConcurrentDictionary<string, (string requestDigest, DateTime expiresOn)>();
+#pragma warning restore CS0169
         private static string userAgentFromConfig = null;
         private static string accessToken = null;
         private static bool hasAuthCookies;
@@ -176,16 +183,37 @@ namespace Microsoft.SharePoint.Client
                 }
                 catch (WebException wex)
                 {
+                    Exception innermostEx = wex;
+                    while (innermostEx.InnerException != null) innermostEx = innermostEx.InnerException;
+                    var socketEx = innermostEx as System.Net.Sockets.SocketException;
+
                     var response = wex.Response as HttpWebResponse;
                     // Check if request was throttled - http status code 429
                     // Check is request failed due to server unavailable - http status code 503
                     if (response != null &&
-                        (response.StatusCode == (HttpStatusCode)429
-                        || response.StatusCode == (HttpStatusCode)503
-                        // || response.StatusCode == (HttpStatusCode)500
-                        ))
+                         (response.StatusCode == (HttpStatusCode)429
+                          || response.StatusCode == (HttpStatusCode)503
+                          || response.StatusCode == (HttpStatusCode)400
+                             // || response.StatusCode == (HttpStatusCode)500
+                         )
+                        || socketEx != null)
                     {
-                        Log.Warning(Constants.LOGGING_SOURCE, CoreResources.ClientContextExtensions_ExecuteQueryRetry, backoffInterval);
+                        if (socketEx != null)
+                        {
+                            Log.Warning("ClientContextExtensions",
+                                "CSOM request socket exception. Sleeping for {0} seconds before retrying.",
+                                backoffInterval);
+                        }
+                        else if (response.StatusCode == (HttpStatusCode)400)
+                        {
+                            Log.Warning("ClientContextExtensions",
+                                "CSOM request frequency exceeded usage limits. Sleeping for {0} seconds before retrying.",
+                                backoffInterval);
+                        }
+                        else
+                        {
+                            Log.Warning(Constants.LOGGING_SOURCE, CoreResources.ClientContextExtensions_ExecuteQueryRetry, backoffInterval);
+                        }
 
 #if !ONPREMISES
                         wrapper = (ClientRequestWrapper)wex.Data["ClientRequest"];
@@ -334,6 +362,7 @@ namespace Microsoft.SharePoint.Client
             clonedClientContext.AuthenticationMode = clientContext.AuthenticationMode;
 #endif
             clonedClientContext.ClientTag = clientContext.ClientTag;
+            clonedClientContext.WebRequestExecutorFactory = clientContext.WebRequestExecutorFactory;
 #if !SP2013
             clonedClientContext.DisableReturnValueCache = clientContext.DisableReturnValueCache;
 #endif
@@ -417,6 +446,7 @@ namespace Microsoft.SharePoint.Client
                             newClientContext.FormDigestHandlingEnabled = (clientContext as ClientContext).FormDigestHandlingEnabled;
 #endif
                             newClientContext.ClientTag = clientContext.ClientTag;
+                            newClientContext.WebRequestExecutorFactory = clientContext.WebRequestExecutorFactory;
 #if !SP2013
                             newClientContext.DisableReturnValueCache = clientContext.DisableReturnValueCache;
 #endif
@@ -972,6 +1002,87 @@ namespace Microsoft.SharePoint.Client
             }
         }
 
+        /// <summary>
+        /// Returns the request digest from the current session/site given cookie based auth
+        /// </summary>
+        /// <param name="context"></param>
+        /// <param name="cookieContainer">A cookiecontainer containing FedAuth cookies</param>
+        /// <returns></returns>
+        public static async Task<string> GetRequestDigestAsync(this ClientContext context, CookieContainer cookieContainer)
+        {
+            if (cookieContainer != null)
+            {
+                var hostUrl = context.Url;
+                if (requestDigestInfos.TryGetValue(hostUrl, out (string digestToken, DateTime expiresOn) requestDigestInfo))
+                {
+                    // We only have to add a request digest when running in dotnet core
+                    if (DateTime.Now > requestDigestInfo.expiresOn)
+                    {
+                        requestDigestInfo = await GetRequestDigestInfoAsync(hostUrl, cookieContainer);
+                        requestDigestInfos.AddOrUpdate(hostUrl, requestDigestInfo, (key, oldValue) => requestDigestInfo);
+                    }
+                }
+                else
+                {
+                    // admin url maybe?
+                    requestDigestInfo = await GetRequestDigestInfoAsync(hostUrl, cookieContainer);
+                    requestDigestInfos.AddOrUpdate(hostUrl, requestDigestInfo, (key, oldValue) => requestDigestInfo);
+                }
+                return requestDigestInfo.digestToken;
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+        private static async Task<(string digestToken, DateTime expiresOn)> GetRequestDigestInfoAsync(string siteUrl, CookieContainer cookieContainer)
+        {
+            await new SynchronizationContextRemover();
+
+            var httpClient = PnPHttpClient.Instance.GetHttpClient();
+
+            string requestUrl = string.Format("{0}/_api/contextinfo", siteUrl.TrimEnd('/'));
+            using (HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, requestUrl))
+            {
+                request.Headers.Add("accept", "application/json;odata=nometadata");
+
+                request.Headers.Add("Cookie", cookieContainer.GetCookieHeader(new Uri(siteUrl)));
+
+                HttpResponseMessage response = await httpClient.SendAsync(request);
+
+
+                string responseString;
+                if (response.IsSuccessStatusCode)
+                {
+                    responseString = await response.Content.ReadAsStringAsync();
+                }
+                else
+                {
+                    var errorSb = new System.Text.StringBuilder();
+
+                    errorSb.AppendLine(await response.Content.ReadAsStringAsync());
+                    if (response.Headers.Contains("SPRequestGuid"))
+                    {
+                        var values = response.Headers.GetValues("SPRequestGuid");
+                        if (values != null)
+                        {
+                            var spRequestGuid = values.FirstOrDefault();
+                            errorSb.AppendLine($"ServerErrorTraceCorrelationId: {spRequestGuid}");
+                        }
+                    }
+
+                    throw new Exception(errorSb.ToString());
+                }
+
+                var contextInformation = System.Text.Json.JsonSerializer.Deserialize<JsonElement>(responseString);
+
+                string formDigestValue = contextInformation.GetProperty("FormDigestValue").GetString();
+                int expiresIn = contextInformation.GetProperty("FormDigestTimeoutSeconds").GetInt32();
+                return (formDigestValue, DateTime.Now.AddSeconds(expiresIn - 30));
+            }
+        }
+
         private static void Context_ExecutingWebRequest(object sender, WebRequestEventArgs e)
         {
             if (!String.IsNullOrEmpty(e.WebRequestExecutor.RequestHeaders.Get("Authorization")))
@@ -1102,5 +1213,42 @@ namespace Microsoft.SharePoint.Client
             return await SiteCollection.DeleteSiteAsync(clientContext);
         }
 #endif
+
+        public static CookieContainer GetAuthenticationCookies(this ClientContext context)
+        {
+            var cookieString = CookieReader.GetCookie(context.Url)?.Replace("; ", ",")?.Replace(";", ",");
+            if (cookieString == null)
+            {
+                return null;
+            }
+            var authCookiesContainer = new CookieContainer();
+            // Get FedAuth and rtFa cookies issued by ADFS when accessing claims aware applications.
+            // - or get the EdgeAccessCookie issued by the Web Application Proxy (WAP) when accessing non-claims aware applications (Kerberos).
+            IEnumerable<string> authCookies = null;
+            if (Regex.IsMatch(cookieString, "FedAuth", RegexOptions.IgnoreCase))
+            {
+                authCookies = cookieString.Split(',').Where(c => c.StartsWith("FedAuth", StringComparison.InvariantCultureIgnoreCase) || c.StartsWith("rtFa", StringComparison.InvariantCultureIgnoreCase));
+            }
+            else if (Regex.IsMatch(cookieString, "EdgeAccessCookie", RegexOptions.IgnoreCase))
+            {
+                authCookies = cookieString.Split(',').Where(c => c.StartsWith("EdgeAccessCookie", StringComparison.InvariantCultureIgnoreCase));
+            }
+            if (authCookies != null)
+            {
+                var siteUri = new Uri(context.Url);
+                var extension = siteUri.Host.Substring(siteUri.Host.LastIndexOf('.') + 1);
+                var cookieCollection = new CookieCollection();
+                foreach (var cookie in authCookies)
+                {
+                    var cookieName = cookie.Substring(0, cookie.IndexOf("=")); // cannot use split as there might '=' in the value
+                    var cookieValue = cookie.Substring(cookieName.Length + 1);
+                    cookieCollection.Add(new Cookie(cookieName, cookieValue));
+                }
+                authCookiesContainer.Add(new Uri($"{siteUri.Scheme}://{siteUri.Host}"), cookieCollection);
+                var adminSiteUri = new Uri(siteUri.Scheme + "://" + siteUri.Authority.Replace($".sharepoint.{extension}", $"-admin.sharepoint.{extension}"));
+                authCookiesContainer.Add(adminSiteUri, cookieCollection);
+            }
+            return authCookiesContainer;
+        }
     }
 }
